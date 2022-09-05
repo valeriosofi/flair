@@ -25,4 +25,5 @@ more-itertools
 wikipedia-api
 pptree
 pytorch_revgrad
+flatbuffers>=2.0.7
 nebullvm>=0.4.1
