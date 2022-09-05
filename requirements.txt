@@ -25,5 +25,3 @@ more-itertools
 wikipedia-api
 pptree
 pytorch_revgrad
-nebullvm>=0.4.1
-tensorflow>=2.9
