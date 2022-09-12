@@ -7,7 +7,7 @@ import zipfile
 from abc import abstractmethod
 from io import BytesIO
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Type, Union, cast
+from typing import Callable, Dict, List, Optional, Tuple, Type, Union, cast
 
 import torch
 from torch.jit import ScriptModule
@@ -472,6 +472,18 @@ class TransformerBaseEmbeddings(Embeddings[Sentence]):
                 device=device,
             )
             model_kwargs["word_ids"] = word_ids
+
+        # Ensure that the keys in the dict are in the proper order expected from the model forward function
+        desired_keys_order = [
+            "input_ids",
+            "lengths",
+            "attention_mask",
+            "overflow_to_sample_mapping",
+            "word_ids",
+            "langs",
+        ]
+        model_kwargs = {k: model_kwargs[k] for k in desired_keys_order if k in model_kwargs}
+
         return model_kwargs
 
     def __gather_flair_tokens(self, sentences: List[Sentence]) -> Tuple[List[List[str]], List[int], List[int]]:
@@ -735,6 +747,88 @@ class TransformerJitEmbeddings(TransformerBaseEmbeddings):
         return param_names, params
 
 
+class TorchWrapper(torch.nn.Module):
+    def __init__(self, embedding: TransformerBaseEmbeddings):
+        super().__init__()
+        self.embedding = embedding
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        lengths: torch.LongTensor,
+        attention_mask: torch.Tensor,
+        overflow_to_sample_mapping: torch.Tensor,
+        word_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        return self.embedding.forward(
+            input_ids=input_ids,
+            lengths=lengths,
+            attention_mask=attention_mask,
+            overflow_to_sample_mapping=overflow_to_sample_mapping,
+            word_ids=word_ids,
+        )["token_embeddings"]
+
+
+class TransformerNebullvmEmbeddings(TransformerBaseEmbeddings):
+    def __init__(self, nebullvm_model, **kwargs):
+        super().__init__(**kwargs)
+        self.model = nebullvm_model
+
+    def _forward_tensors(self, tensors) -> Dict[str, torch.Tensor]:
+        return {"token_embeddings": self.model(*tensors.values())[0]}
+
+    @classmethod
+    def convert_dynamic_axes(cls, dynamic_info: Dict[str, Dict[int, str]]) -> Dict[str, List[Dict[int, str]]]:
+        dynamic_axes: Dict[str, List[Dict[int, str]]] = dict()
+        dynamic_axes["inputs"] = []
+        dynamic_axes["outputs"] = []
+        for k, v in dynamic_info.items():
+            if k not in ["token_embeddings", "document_embeddings"]:
+                dynamic_axes["inputs"].append(v)
+            else:
+                dynamic_axes["outputs"].append(v)
+
+        return dynamic_axes
+
+    @classmethod
+    def optimize_model(
+        cls,
+        embedding: "TransformerEmbeddings",
+        example_sentences: List[Sentence],
+        metric_drop_ths: float = None,
+        metric: Union[str, Callable] = None,
+        optimization_time: str = "constrained",
+        dynamic_info: Dict = None,
+        config_file: str = None,
+        ignore_compilers: List[str] = None,
+    ):
+        example_tensors = embedding.prepare_tensors(example_sentences)
+
+        if dynamic_info is None:
+            dynamic_axes = TransformerOnnxEmbeddings.collect_dynamic_axes(embedding, example_tensors)
+            dynamic_info = cls.convert_dynamic_axes(dynamic_axes)
+
+        input_data = [(tuple(example_tensors.values()), 0)]
+        torch_wrapper = TorchWrapper(embedding)
+        torch_wrapper.eval()
+
+        # Import nebullvm only if it is used
+        from nebullvm.api.functions import optimize_model
+
+        optimized_model = optimize_model(
+            torch_wrapper,
+            input_data=input_data,
+            metric_drop_ths=metric_drop_ths,
+            metric=metric,
+            optimization_time=optimization_time,
+            dynamic_info=dynamic_info,
+            config_file=config_file,
+            ignore_compilers=ignore_compilers,
+        )
+
+        return cls(optimized_model, **embedding.to_args())
+
+
 class TransformerJitWordEmbeddings(TokenEmbeddings, TransformerJitEmbeddings):
     def __init__(
         self,
@@ -769,6 +863,7 @@ class TransformerOnnxDocumentEmbeddings(DocumentEmbeddings, TransformerOnnxEmbed
 
 class TransformerEmbeddings(TransformerBaseEmbeddings):
     onnx_cls: Type[TransformerOnnxEmbeddings] = TransformerOnnxEmbeddings
+    nebullvm_cls: Type[TransformerNebullvmEmbeddings] = TransformerNebullvmEmbeddings
 
     def __init__(
         self,
@@ -1134,3 +1229,30 @@ class TransformerEmbeddings(TransformerBaseEmbeddings):
         sentences with some variation.
         """
         return self.onnx_cls.export_from_embedding(path, self, example_sentences, **kwargs)
+
+    def optimize_nebullvm(
+        self,
+        example_sentences: List[Sentence],
+        metric_drop_ths: float = None,
+        metric: Union[str, Callable] = None,
+        optimization_time: str = "constrained",
+        dynamic_info: Dict = None,
+        config_file: str = None,
+        ignore_compilers: List[str] = None,
+    ):
+        """Optimize the input model using the nebullvm api.
+        :param example_sentences: a list of sentences that will be used for tracing. It is recommended to take 2-4
+        sentences with some variation.
+        Info about other optional params can be found in the nebullvm documentation:
+        https://nebuly.gitbook.io/nebuly/nebulgym/get-started
+        """
+        return self.nebullvm_cls.optimize_model(
+            self,
+            example_sentences,
+            metric_drop_ths,
+            metric,
+            optimization_time,
+            dynamic_info,
+            config_file,
+            ignore_compilers,
+        )
